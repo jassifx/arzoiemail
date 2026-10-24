@@ -778,8 +778,12 @@ namespace RegressionTests.Shared
             case eDBtype.hDBTypeMSSQL:
             case eDBtype.hDBTypeMSSQLCE:
                break;
-            case eDBtype.hDBTypeMySQL:
             case eDBtype.hDBTypePostgreSQL:
+               // standard_conforming_strings has been on by default since PostgreSQL 9.1, so a
+               // backslash in a literal is a backslash. Doubled, it is stored doubled - which
+               // matched the server only while it doubled the backslashes of its own values too.
+               break;
+            case eDBtype.hDBTypeMySQL:
                escapedValue = escapedValue.Replace("\\", "\\\\");
                break;
             default:

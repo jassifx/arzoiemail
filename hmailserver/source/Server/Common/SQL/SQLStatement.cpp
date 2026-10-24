@@ -641,6 +641,76 @@ namespace HM
       return result;
    }
 
+   bool
+   SQLStatement::ToPositionalParameters(const SQLCommand &command, String &positionalQuery,
+                                        std::vector<const SQLParameter *> &orderedParameters)
+   {
+      // For the database clients that bind parameters by position (PostgreSQL's $1, $2, ...).
+      // The query is scanned once, as GenerateFromCommand does, and every parameter name is
+      // replaced by the position of its parameter. A parameter used twice gets the same
+      // position both times; the positions follow the order the names first appear in.
+      //
+      // A bound parameter is a value, so it cannot stand inside a literal of the query, where
+      // the server would read $1 as the two characters. Such a query is refused: false, and
+      // the caller should not run it.
+      const String queryString = command.GetQueryString();
+      const std::list<SQLParameter> &parameters = command.GetParameters();
+
+      const std::wstring &query = queryString;
+
+      positionalQuery.clear();
+      positionalQuery.reserve(query.size());
+      orderedParameters.clear();
+
+      bool insideLiteral = false;
+
+      size_t position = 0;
+      while (position < query.size())
+      {
+         wchar_t c = query[position];
+
+         // '' inside a literal is an escaped quote: it ends the literal and starts it again,
+         // which leaves the state as it was.
+         if (c == '\'')
+            insideLiteral = !insideLiteral;
+
+         if (c != '@')
+         {
+            positionalQuery += c;
+            position++;
+            continue;
+         }
+
+         size_t end = position + 1;
+         while (end < query.size() && IsParameterNameCharacter(query[end]))
+            end++;
+
+         const String token = query.substr(position, end - position);
+
+         auto parameter = std::find_if(parameters.begin(), parameters.end(),
+            [&token](const SQLParameter &candidate) { return candidate.GetName() == token; });
+
+         if (end == position + 1 || parameter == parameters.end())
+            positionalQuery += token;
+         else
+         {
+            if (insideLiteral)
+               return false;
+
+            auto bound = std::find(orderedParameters.begin(), orderedParameters.end(), &*parameter);
+            size_t index = bound - orderedParameters.begin();
+            if (bound == orderedParameters.end())
+               orderedParameters.push_back(&*parameter);
+
+            positionalQuery += _T("$") + StringParser::IntToString((int) index + 1);
+         }
+
+         position = end;
+      }
+
+      return true;
+   }
+
    String
    SQLStatement::ConvertWildcardToLike(String input)
    {
@@ -679,6 +749,36 @@ namespace HM
                "], got [" + AnsiString(actual) + "].";
             throw std::logic_error(message.c_str());
          }
+      }
+
+      void AssertPositional(const SQLCommand &command, const String &expectedQuery, const std::vector<AnsiString> &expectedNames)
+      {
+         String actualQuery;
+         std::vector<const SQLParameter *> actualParameters;
+
+         if (!SQLStatement::ToPositionalParameters(command, actualQuery, actualParameters))
+            throw std::logic_error(("SQLStatement::ToPositionalParameters refused [" + AnsiString(command.GetQueryString()) + "].").c_str());
+
+         if (actualQuery != expectedQuery)
+            throw std::logic_error(("SQLStatement::ToPositionalParameters: expected [" + AnsiString(expectedQuery) +
+               "], got [" + AnsiString(actualQuery) + "].").c_str());
+
+         bool sameNames = actualParameters.size() == expectedNames.size();
+         for (size_t i = 0; sameNames && i < expectedNames.size(); i++)
+            sameNames = actualParameters[i]->GetName() == String(expectedNames[i]);
+
+         if (!sameNames)
+            throw std::logic_error(("SQLStatement::ToPositionalParameters: wrong parameter order for [" + AnsiString(expectedQuery) + "].").c_str());
+      }
+
+      void AssertPositionalRefused(const SQLCommand &command)
+      {
+         String query;
+         std::vector<const SQLParameter *> parameters;
+
+         if (SQLStatement::ToPositionalParameters(command, query, parameters))
+            throw std::logic_error(("SQLStatement::ToPositionalParameters accepted a parameter inside a literal: [" +
+               AnsiString(command.GetQueryString()) + "].").c_str());
       }
    }
 
@@ -732,7 +832,7 @@ namespace HM
       }
 
       // A parameter inside a literal of the query, as the PostgreSQL interval of
-      // PersistentFetchAccount uses.
+      // PersistentFetchAccount once had. Written as text, it still works.
       {
          SQLCommand command(_T("update hm_fetchaccounts set fanexttry = current_timestamp + INTERVAL '@MINUTES minutes' where faid = @FAID"));
          command.AddParameter("@MINUTES", 15);
@@ -745,6 +845,35 @@ namespace HM
          SQLCommand command(_T("select * from t where a = @A"));
          command.AddParameter("@A", String(_T("")));
          AssertGenerated(command, _T("select * from t where a = ''"));
+      }
+
+      // Positional parameters: numbered in the order the names first appear, a name used
+      // twice gets one position, and nothing else in the query changes.
+      {
+         SQLCommand command(_T("select @@IDENTITY, 'a@b' from t where a = @A and b = @B and c = @A and d = @UNKNOWN"));
+         command.AddParameter("@B", 2);
+         command.AddParameter("@A", String(_T("x@B")));
+         command.AddParameter("@UNUSED", 3);
+         AssertPositional(command, _T("select @@IDENTITY, 'a@b' from t where a = $1 and b = $2 and c = $1 and d = @UNKNOWN"), { "@A", "@B" });
+      }
+
+      // An escaped quote does not end the literal it is in, and a literal that has ended
+      // leaves the parameters after it alone.
+      {
+         SQLCommand command(_T("select * from t where a = 'it''s' and b = @A"));
+         command.AddParameter("@A", 1);
+         AssertPositional(command, _T("select * from t where a = 'it''s' and b = $1"), { "@A" });
+      }
+
+      // A parameter inside a literal cannot be bound, and the query is refused.
+      {
+         SQLCommand command(_T("update t set d = current_timestamp + INTERVAL '@MINUTES minutes'"));
+         command.AddParameter("@MINUTES", 15);
+         AssertPositionalRefused(command);
+
+         SQLCommand escaped(_T("select * from t where a = 'it''s @A'"));
+         escaped.AddParameter("@A", 1);
+         AssertPositionalRefused(escaped);
       }
    }
 }

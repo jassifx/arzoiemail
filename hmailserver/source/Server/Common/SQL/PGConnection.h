@@ -23,7 +23,13 @@ namespace HM
       DALConnection::ExecutionResult CheckError(PGresult *pResult, const String &sAdditionalInfo, String &sOutputErrorMessage) const;
       PGconn *GetConnection() const;
 
-      virtual bool GetSupportsCommandParameters() const {return false; }
+      virtual bool GetSupportsCommandParameters() const {return true; }
+
+      bool Run(const SQLCommand &command, PGresult *&result, String &sErrorMessage) const;
+      // Sends the command: with its parameters bound, through PQexecParams, when it has any,
+      // and through PQexec otherwise, which unlike PQexecParams runs scripts of several
+      // statements. False, with the reason in sErrorMessage, if the command could not be
+      // sent at all. A command that was sent can still fail; CheckError tells.
       virtual void OnConnected();
 
       virtual bool BeginTransaction(String &sErrorMessage);

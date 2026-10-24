@@ -40,6 +40,14 @@ namespace HM
    {
       int iInputLength = sInput.GetLength();
 
+      // WideCharToMultiByte returns 0 both on failure and when there is nothing to convert,
+      // so an empty string would otherwise be reported as a failure.
+      if (iInputLength == 0)
+      {
+         sOutput.clear();
+         return true;
+      }
+
       int nNeedSize = WideCharToMultiByte(CP_UTF8, 0, sInput, iInputLength, NULL, 0, NULL, NULL ) +1;
 
       if( WideCharToMultiByte( CP_UTF8, 0, sInput, iInputLength, sOutput.GetBuffer(nNeedSize), nNeedSize, NULL, NULL ) == 0 )
@@ -52,6 +60,13 @@ namespace HM
    Unicode::MultiByteToWide(const AnsiString &sInput, String &sOutput)
    {
       int iInputLength = sInput.GetLength();
+
+      // As above: 0 also means there was nothing to convert.
+      if (iInputLength == 0)
+      {
+         sOutput.clear();
+         return true;
+      }
 
       int nNeedSize = MultiByteToWideChar( CP_UTF8, 0, sInput, iInputLength, NULL, 0);
 

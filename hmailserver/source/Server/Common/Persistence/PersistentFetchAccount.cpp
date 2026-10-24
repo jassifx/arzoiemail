@@ -223,8 +223,9 @@ namespace HM
          command.SetQueryString(_T("update hm_fetchaccounts set fanexttry = DATEADD(mi, faminutes, GETDATE()) where faid = @FAID"));
          break;
       case DatabaseSettings::TypePGServer:
-         command.SetQueryString(_T("update hm_fetchaccounts set fanexttry = current_timestamp + INTERVAL '@MINUTES minutes' where faid = @FAID"));
-         command.AddParameter("@MINUTES", pFA->GetMinutesBetweenTry());
+         // The column, as the other databases use it. A parameter inside the interval
+         // literal, as this was before, cannot be bound.
+         command.SetQueryString(_T("update hm_fetchaccounts set fanexttry = current_timestamp + faminutes * INTERVAL '1 minute' where faid = @FAID"));
          break;
       }
 

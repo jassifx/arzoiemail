@@ -8,8 +8,9 @@ namespace HM
    class DatabaseSettings;
    class DateTime;
    class SQLCommand;
+   class SQLParameter;
 
-   class  SQLStatement  
+   class  SQLStatement
    {
    public:
 
@@ -71,6 +72,11 @@ namespace HM
       int GetNoOfCols() const;
 
       String GenerateFromCommand(const SQLCommand &command);
+
+      static bool ToPositionalParameters(const SQLCommand &command, String &positionalQuery,
+                                         std::vector<const SQLParameter *> &orderedParameters);
+      // Rewrites the parameter names of the command into $1, $2, ... for a client that binds
+      // parameters by position. False if a parameter stands inside a literal of the query.
 
       static String GetCurrentTimestamp();
       static String GetCurrentTimestampPlusMinutes(int iMinutes);

@@ -47,16 +47,13 @@ namespace HM
 
       try
       {
-         AnsiString sQuery;
-         if (!Unicode::WideToMultiByte(sSQL, sQuery))
+         String runError;
+         if (!pConn->Run(command, result_, runError))
          {
-            ErrorManager::Instance()->ReportError(ErrorManager::Critical, 5107, "PGConnection::TryOpen", "Could not convert string into multi-byte.");
+            ErrorManager::Instance()->ReportError(ErrorManager::Critical, 5107, "PGConnection::TryOpen", runError);
+            sErrorMessage = runError;
             return DALConnection::DALUnknown;
          }
-
-         PGconn *pPG = pConn->GetConnection();
-        
-         result_ = PQexec(pPG, sQuery);
 
          DALConnection::ExecutionResult result = pConn->CheckError(result_, sSQL, sErrorMessage);
          if (result != DALConnection::DALSuccess)

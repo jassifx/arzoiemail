@@ -7,6 +7,8 @@
 #include "DatabaseSettings.h"
 #include "../Util/Unicode.h"
 #include "Macros/PGSQLMacroExpander.h"
+#include "SQLCommand.h"
+#include "SQLStatement.h"
 
 #ifdef _DEBUG
 #define DEBUG_NEW new(_NORMAL_BLOCK, __FILE__, __LINE__)
@@ -51,15 +53,26 @@ namespace HM
          String sDatabase = database_settings_->GetDatabaseName();
          long lDBPort = database_settings_->GetPort();
         
-         String sConnectionString;
-         sConnectionString.Format(_T("host='%s' port='%d' user='%s' password='%s'"), sServer.c_str(), lDBPort, sUsername.c_str(), sPassword.c_str());
+         // Keywords and values are passed separately, so that no value needs quoting. Written
+         // into a connection string, a ' or a \ in the password - or any other setting - ended
+         // its value early, or swallowed the next one. UTF-8, which SCRAM authentication
+         // expects, rather than the system code page.
+         AnsiString host, port, user, password, database;
+         if (!Unicode::WideToMultiByte(sServer, host) ||
+             !Unicode::WideToMultiByte(StringParser::IntToString((int) lDBPort), port) ||
+             !Unicode::WideToMultiByte(sUsername, user) ||
+             !Unicode::WideToMultiByte(sPassword, password) ||
+             !Unicode::WideToMultiByte(sDatabase.IsEmpty() ? String(_T("postgres")) : sDatabase, database))
+         {
+            // Retrying would not change the outcome.
+            sErrorMessage = "Could not convert the database settings into UTF-8.";
+            return FatalError;
+         }
 
-         if (sDatabase.IsEmpty())
-            sConnectionString += " dbname='postgres'";
-         else
-            sConnectionString += " dbname='" + sDatabase + "'";
+         const char *keywords[] = { "host", "port", "user", "password", "dbname", nullptr };
+         const char *values[] = { host.c_str(), port.c_str(), user.c_str(), password.c_str(), database.c_str(), nullptr };
 
-         dbconn_ = PQconnectdb(Unicode::ToANSI(sConnectionString));
+         dbconn_ = PQconnectdbParams(keywords, values, 0);
 
         
          if (PQstatus(dbconn_) != CONNECTION_OK)
@@ -99,17 +112,14 @@ namespace HM
 
       try
       {
-         // PG_query-doc:
-         // Zero if the query was successful. Non-zero if an error occurred.
-         // 
-         AnsiString sQuery;
-         if (!Unicode::WideToMultiByte(SQL, sQuery))
+         PGresult *pResult = nullptr;
+         String runError;
+         if (!Run(command, pResult, runError))
          {
-            ErrorManager::Instance()->ReportError(ErrorManager::Critical, 5106, "PGConnection::TryExecute", "Could not convert string into multi-byte.");
+            ErrorManager::Instance()->ReportError(ErrorManager::Critical, 5106, "PGConnection::TryExecute", runError);
+            sErrorMessage = runError;
             return DALConnection::DALUnknown;
          }
-
-         PGresult *pResult = PQexec(dbconn_, sQuery);
 
          bool bIgnoreErrors = SQL.Find(_T("[IGNORE-ERRORS]")) >= 0;
 
@@ -147,6 +157,99 @@ namespace HM
       }
 
       return DALConnection::DALSuccess;
+   }
+
+   namespace
+   {
+      // From the PostgreSQL catalog (pg_type.dat). libpq-fe.h does not carry them.
+      const Oid PG_INT4_OID = 23;
+      const Oid PG_INT8_OID = 20;
+
+      // A string parameter is sent with no type, so that the server takes the type the
+      // context gives it - a varchar column, a timestamp - as it did with the literals
+      // written before.
+      const Oid PG_UNTYPED = 0;
+   }
+
+   bool
+   PGConnection::Run(const SQLCommand &command, PGresult *&result, String &sErrorMessage) const
+   {
+      result = nullptr;
+
+      if (command.GetParameters().empty())
+      {
+         AnsiString query;
+         if (!Unicode::WideToMultiByte(command.GetQueryString(), query))
+         {
+            sErrorMessage = _T("Could not convert the query into UTF-8: ") + command.GetQueryString();
+            return false;
+         }
+
+         result = PQexec(dbconn_, query);
+         return true;
+      }
+
+      String positionalQuery;
+      std::vector<const SQLParameter *> parameters;
+      if (!SQLStatement::ToPositionalParameters(command, positionalQuery, parameters))
+      {
+         sErrorMessage = _T("A parameter of the query stands inside a literal, where it cannot be bound: ") + command.GetQueryString();
+         return false;
+      }
+
+      AnsiString query;
+      if (!Unicode::WideToMultiByte(positionalQuery, query))
+      {
+         sErrorMessage = _T("Could not convert the query into UTF-8: ") + command.GetQueryString();
+         return false;
+      }
+
+      // Every value is sent as text, the format libpq takes by default, together with the
+      // type of the number parameters.
+      std::vector<AnsiString> values(parameters.size());
+      std::vector<Oid> types(parameters.size());
+
+      for (size_t i = 0; i < parameters.size(); i++)
+      {
+         const SQLParameter &parameter = *parameters[i];
+
+         switch (parameter.GetType())
+         {
+         case SQLParameter::ParamTypeInt32:
+            types[i] = PG_INT4_OID;
+            values[i] = AnsiString(StringParser::IntToString(parameter.GetInt32Value()));
+            break;
+         case SQLParameter::ParamTypeInt64:
+            types[i] = PG_INT8_OID;
+            values[i] = AnsiString(StringParser::IntToString(parameter.GetInt64Value()));
+            break;
+         case SQLParameter::ParamTypeUnsignedInt32:
+            // Above 2^31 - 1, which int4 cannot hold.
+            types[i] = PG_INT8_OID;
+            values[i] = AnsiString(StringParser::IntToString(parameter.GetUnsignedInt32Value()));
+            break;
+         case SQLParameter::ParamTypeString:
+            types[i] = PG_UNTYPED;
+            if (!Unicode::WideToMultiByte(parameter.GetStringValue(), values[i]))
+            {
+               sErrorMessage = _T("Could not convert the value of ") + parameter.GetName() + _T(" into UTF-8.");
+               return false;
+            }
+            break;
+         default:
+            sErrorMessage = _T("The parameter ") + parameter.GetName() + _T(" has a type that cannot be bound.");
+            return false;
+         }
+      }
+
+      // Taken once the values are complete, so that no pointer outlives a reallocation.
+      std::vector<const char *> valuePointers(parameters.size());
+      for (size_t i = 0; i < parameters.size(); i++)
+         valuePointers[i] = values[i].c_str();
+
+      result = PQexecParams(dbconn_, query, (int) parameters.size(), types.data(), valuePointers.data(),
+                            nullptr, nullptr, 0);
+      return true;
    }
 
    bool
