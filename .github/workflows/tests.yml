@@ -29,6 +29,15 @@ on:
         required: false
         type: string
         default: Debug
+      database:
+        description: 'Database the installed server runs on: internal (SQL Server Compact, what
+          a silent install sets up), postgresql (the PostgreSQL server of the runner image) or
+          mysql (the MySQL server of the runner image, on a data directory of its own).
+          The MySQL and PostgreSQL connections write their command parameters into the SQL
+          themselves rather than binding them, so they need runs of their own.'
+        required: false
+        type: string
+        default: internal
 
 # Read-only token. A called workflow can never exceed the caller's permissions anyway,
 # but declaring it keeps this workflow honest if it is ever called from elsewhere.
@@ -58,7 +67,12 @@ jobs:
       - name: Install hMailServer
         env:
           INSTALLER_ARTIFACT: ${{ inputs.installer-artifact }}
+          DATABASE: ${{ inputs.database }}
         run: |
+          # A workflow_call input is whatever the caller passes; an unknown database would
+          # otherwise quietly run the tests on the internal one.
+          if ($env:DATABASE -notin @('internal', 'postgresql', 'mysql')) { throw "The database must be internal, postgresql or mysql, was '$env:DATABASE'." }
+
           $setup = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'installer\*.exe') | Select-Object -First 1
           if (-not $setup) { throw "The '$env:INSTALLER_ARTIFACT' artifact contains no executable." }
           "Installing $($setup.Name)"
@@ -93,6 +107,73 @@ jobs:
           # missing registration would surface as a build error later.
           $application = New-Object -ComObject 'hMailServer.Application'
           "Installed hMailServer $($application.Version)"
+
+      - name: Move the server to PostgreSQL
+        if: inputs.database == 'postgresql'
+        run: |
+          # The runner image carries a PostgreSQL server whose service is disabled, with the
+          # user postgres and the password root. Its version is in the service name.
+          $service = Get-Service -Name 'postgresql-x64-*' | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $service) { throw "The runner image has no PostgreSQL service." }
+          Set-Service -Name $service.Name -StartupType Manual
+          Start-Service -Name $service.Name
+          "Started $($service.Name)"
+
+          # What DBSetup does: create the database and its tables, point hMailServer.ini at
+          # it, and have the server reconnect.
+          $application = New-Object -ComObject 'hMailServer.Application'
+          if (-not $application.Authenticate('Administrator', '')) { throw "Could not authenticate with the blank administrator password." }
+
+          $hDBTypePostgreSQL = 3
+          $application.Database.CreateExternalDatabase($hDBTypePostgreSQL, 'localhost', 5432, 'hmailserver', 'postgres', 'root')
+          $application.Database.SetDefaultDatabase($hDBTypePostgreSQL, 'localhost', 5432, 'hmailserver', 'postgres', 'root')
+          $application.Reinitialize()
+
+          $database = $application.Database
+          if ($database.DatabaseType -ne $hDBTypePostgreSQL) { throw "The server runs on database type $($database.DatabaseType), not PostgreSQL." }
+          "hMailServer now runs on PostgreSQL ($($database.ServerName), database $($database.DatabaseName), version $($database.CurrentVersion))"
+
+      - name: Move the server to MySQL
+        if: inputs.database == 'mysql'
+        run: |
+          # The runner image carries a MySQL server, but no data directory to run it on. A new
+          # one, initialised without a root password, is what a run needs - whatever service or
+          # password the image may come with.
+          $mysqld = Get-ChildItem 'C:\Program Files\MySQL' -Recurse -Filter 'mysqld.exe' -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $mysqld) { throw "The runner image has no MySQL server." }
+          & $mysqld.FullName --version
+
+          $dataDirectory = Join-Path $env:RUNNER_TEMP 'mysql-data'
+          & $mysqld.FullName --initialize-insecure "--datadir=$dataDirectory" --console
+          if ($LASTEXITCODE -ne 0) { throw "mysqld --initialize-insecure failed with exit code $LASTEXITCODE" }
+
+          # Its own port, clear of any instance the image starts. The default authentication,
+          # caching_sha2_password, is left as it is: libmariadb carries the plugin.
+          $port = 3307
+          Start-Process -FilePath $mysqld.FullName -ArgumentList "--datadir=$dataDirectory", "--port=$port", '--console' `
+              -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP 'mysqld.out') -RedirectStandardError (Join-Path $env:RUNNER_TEMP 'mysqld.err')
+
+          $deadline = (Get-Date).AddMinutes(2)
+          while (-not (Test-NetConnection -ComputerName 127.0.0.1 -Port $port -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+              if ((Get-Date) -gt $deadline) { Get-Content (Join-Path $env:RUNNER_TEMP 'mysqld.err'); throw "MySQL did not start listening on port $port." }
+              Start-Sleep -Seconds 2
+          }
+          "MySQL listens on port $port"
+
+          # What DBSetup does: create the database and its tables, point hMailServer.ini at
+          # it, and have the server reconnect.
+          $application = New-Object -ComObject 'hMailServer.Application'
+          if (-not $application.Authenticate('Administrator', '')) { throw "Could not authenticate with the blank administrator password." }
+
+          $hDBTypeMySQL = 1
+          $application.Database.CreateExternalDatabase($hDBTypeMySQL, '127.0.0.1', $port, 'hmailserver', 'root', '')
+          $application.Database.SetDefaultDatabase($hDBTypeMySQL, '127.0.0.1', $port, 'hmailserver', 'root', '')
+          $application.Reinitialize()
+
+          $database = $application.Database
+          if ($database.DatabaseType -ne $hDBTypeMySQL) { throw "The server runs on database type $($database.DatabaseType), not MySQL." }
+          "hMailServer now runs on MySQL ($($database.ServerName), database $($database.DatabaseName), version $($database.CurrentVersion))"
 
       - name: Build the test solution
         env:
@@ -138,6 +219,8 @@ jobs:
 
       - name: Summarise the NUnit result
         if: always()
+        env:
+          DATABASE: ${{ inputs.database }}
         run: |
           $result = Join-Path $env:GITHUB_WORKSPACE 'TestResult.xml'
           if (-not (Test-Path $result)) {
@@ -147,7 +230,7 @@ jobs:
 
           $run = ([xml](Get-Content $result -Raw)).'test-run'
           $lines = @(
-              '## Regression tests',
+              "## Regression tests ($env:DATABASE database)",
               '',
               '| Total | Passed | Failed | Skipped | Duration |',
               '| ----: | -----: | -----: | ------: | -------: |',
@@ -171,7 +254,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: regression-test-result
+          # Suffixed for the external databases, whose runs share a workflow run with the
+          # internal one, and artifact names are unique within a run.
+          name: regression-test-result${{ inputs.database != 'internal' && format('-{0}', inputs.database) || '' }}
           path: TestResult.xml
           if-no-files-found: warn
 
@@ -179,7 +264,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: regression-test-logs
+          name: regression-test-logs${{ inputs.database != 'internal' && format('-{0}', inputs.database) || '' }}
           # New installations log to ProgramData\ArzoieMail. The hMailServer paths are kept
           # for installations upgraded from hMailServer.
           path: |
